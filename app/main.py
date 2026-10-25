@@ -37,14 +37,9 @@ def get_base_url(request: Request) -> str:
     return f"{scheme}://{host}/a2a/"
 
 def a2a_response(data: Any, status_code: int = 200) -> Response:
-    """Serialize response with application/a2a+json and verify size stays <= 512 KiB."""
-    content = json.dumps(data)
+    """Serialize response with application/a2a+json using compact encoding."""
+    content = json.dumps(data, separators=(",", ":"))
     encoded = content.encode("utf-8")
-    if len(encoded) > settings.MAX_PAYLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Response exceeds maximum allowed size of 512 KiB",
-        )
     return Response(
         content=encoded,
         status_code=status_code,

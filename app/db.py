@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 from app.config import settings
 
@@ -14,12 +15,13 @@ class TaskConflictError(Exception):
 class Database:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or settings.DATABASE_PATH
+        self._lock = threading.RLock()
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn = sqlite3.connect(self.db_path, timeout=60.0)
         conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA busy_timeout = 10000;")
+        conn.execute("PRAGMA busy_timeout = 30000;")
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.row_factory = sqlite3.Row
         return conn
@@ -93,39 +95,40 @@ class Database:
 
     def save_new_task(self, task_dict: Dict[str, Any], principal: str, message_id: str, content_hash: str) -> str:
         """Atomically persist a newly created task and its idempotency record."""
-        with self._get_connection() as conn:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO tasks (id, principal, context_id, state, history_json, artifacts_json)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_dict["id"],
-                        principal,
-                        task_dict["contextId"],
-                        task_dict["state"],
-                        json.dumps(task_dict.get("history", [])),
-                        json.dumps(task_dict.get("artifacts", [])),
+        with self._lock:
+            with self._get_connection() as conn:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO tasks (id, principal, context_id, state, history_json, artifacts_json)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            task_dict["id"],
+                            principal,
+                            task_dict["contextId"],
+                            task_dict["state"],
+                            json.dumps(task_dict.get("history", [])),
+                            json.dumps(task_dict.get("artifacts", [])),
+                        )
                     )
-                )
-                conn.execute(
-                    "INSERT INTO idempotency (principal, message_id, content_hash, task_id) VALUES (?, ?, ?, ?)",
-                    (principal, message_id, content_hash, task_dict["id"])
-                )
-                return task_dict["id"]
-            except sqlite3.IntegrityError:
-                # Race condition: concurrent equivalent request already saved this message
-                cursor = conn.execute(
-                    "SELECT task_id, content_hash FROM idempotency WHERE principal = ? AND message_id = ?",
-                    (principal, message_id)
-                )
-                row = cursor.fetchone()
-                if row:
-                    if row["content_hash"] == content_hash:
-                        return row["task_id"]
-                    raise IdempotencyConflictError(f"IDEMPOTENCY_CONFLICT: Message {message_id} reused with changed content.")
-                raise
+                    conn.execute(
+                        "INSERT INTO idempotency (principal, message_id, content_hash, task_id) VALUES (?, ?, ?, ?)",
+                        (principal, message_id, content_hash, task_dict["id"])
+                    )
+                    return task_dict["id"]
+                except sqlite3.IntegrityError:
+                    # Race condition: concurrent equivalent request already saved this message
+                    cursor = conn.execute(
+                        "SELECT task_id, content_hash FROM idempotency WHERE principal = ? AND message_id = ?",
+                        (principal, message_id)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        if row["content_hash"] == content_hash:
+                            return row["task_id"]
+                        raise IdempotencyConflictError(f"IDEMPOTENCY_CONFLICT: Message {message_id} reused with changed content.")
+                    raise
 
     def get_task(self, task_id: str, principal: str) -> Optional[Dict[str, Any]]:
         """Fetch task only if it belongs to principal."""
@@ -169,39 +172,40 @@ class Database:
         Raises TaskConflictError (409) if the task is already terminal (COMPLETED or CANCELED).
         Returns None if task does not exist or belongs to another principal (404).
         """
-        with self._get_connection() as conn:
-            # Check current status
-            cursor = conn.execute(
-                "SELECT state, history_json, artifacts_json, context_id FROM tasks WHERE id = ? AND principal = ?",
-                (task_id, principal)
-            )
-            row = cursor.fetchone()
-            if not row:
-                return None
-            
-            current_state = row["state"]
-            if current_state in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
-                raise TaskConflictError(f"Task {task_id} is already in terminal state {current_state}")
+        with self._lock:
+            with self._get_connection() as conn:
+                # Check current status
+                cursor = conn.execute(
+                    "SELECT state, history_json, artifacts_json, context_id FROM tasks WHERE id = ? AND principal = ?",
+                    (task_id, principal)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                
+                current_state = row["state"]
+                if current_state in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
+                    raise TaskConflictError(f"Task {task_id} is already in terminal state {current_state}")
 
-            # Atomic transition
-            cursor = conn.execute(
-                """
-                UPDATE tasks 
-                SET state = 'TASK_STATE_CANCELED', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND principal = ? AND state = 'TASK_STATE_INPUT_REQUIRED'
-                """,
-                (task_id, principal)
-            )
-            if cursor.rowcount == 0:
-                raise TaskConflictError(f"Task {task_id} state transition failed due to race condition.")
+                # Atomic transition
+                cursor = conn.execute(
+                    """
+                    UPDATE tasks 
+                    SET state = 'TASK_STATE_CANCELED', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND principal = ? AND state = 'TASK_STATE_INPUT_REQUIRED'
+                    """,
+                    (task_id, principal)
+                )
+                if cursor.rowcount == 0:
+                    raise TaskConflictError(f"Task {task_id} state transition failed due to race condition.")
 
-            return {
-                "id": task_id,
-                "contextId": row["context_id"],
-                "state": "TASK_STATE_CANCELED",
-                "history": json.loads(row["history_json"]),
-                "artifacts": json.loads(row["artifacts_json"]),
-            }
+                return {
+                    "id": task_id,
+                    "contextId": row["context_id"],
+                    "state": "TASK_STATE_CANCELED",
+                    "history": json.loads(row["history_json"]),
+                    "artifacts": json.loads(row["artifacts_json"]),
+                }
 
     def complete_task_with_receipts(
         self,
@@ -216,51 +220,52 @@ class Database:
         Atomically complete a task with accepted receipts.
         Raises TaskConflictError (409) if task is not in TASK_STATE_INPUT_REQUIRED.
         """
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT state, context_id FROM tasks WHERE id = ? AND principal = ?",
-                (task_id, principal)
-            )
-            row = cursor.fetchone()
-            if not row:
-                return None
-
-            current_state = row["state"]
-            if current_state in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
-                raise TaskConflictError(f"Task {task_id} is already in terminal state {current_state}")
-
-            cursor = conn.execute(
-                """
-                UPDATE tasks
-                SET state = 'TASK_STATE_COMPLETED',
-                    history_json = ?,
-                    artifacts_json = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND principal = ? AND state = 'TASK_STATE_INPUT_REQUIRED'
-                """,
-                (
-                    json.dumps(new_history),
-                    json.dumps(new_artifacts),
-                    task_id,
-                    principal,
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT state, context_id FROM tasks WHERE id = ? AND principal = ?",
+                    (task_id, principal)
                 )
-            )
-            if cursor.rowcount == 0:
-                raise TaskConflictError(f"Task {task_id} could not be completed; current state is terminal or conflict.")
+                row = cursor.fetchone()
+                if not row:
+                    return None
 
-            # Record idempotency for continuation message
-            conn.execute(
-                "INSERT OR REPLACE INTO idempotency (principal, message_id, content_hash, task_id) VALUES (?, ?, ?, ?)",
-                (principal, message_id, content_hash, task_id)
-            )
+                current_state = row["state"]
+                if current_state in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
+                    raise TaskConflictError(f"Task {task_id} is already in terminal state {current_state}")
 
-            return {
-                "id": task_id,
-                "contextId": row["context_id"],
-                "state": "TASK_STATE_COMPLETED",
-                "history": new_history,
-                "artifacts": new_artifacts,
-            }
+                cursor = conn.execute(
+                    """
+                    UPDATE tasks
+                    SET state = 'TASK_STATE_COMPLETED',
+                        history_json = ?,
+                        artifacts_json = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND principal = ? AND state = 'TASK_STATE_INPUT_REQUIRED'
+                    """,
+                    (
+                        json.dumps(new_history),
+                        json.dumps(new_artifacts),
+                        task_id,
+                        principal,
+                    )
+                )
+                if cursor.rowcount == 0:
+                    raise TaskConflictError(f"Task {task_id} could not be completed; current state is terminal or conflict.")
+
+                # Record idempotency for continuation message
+                conn.execute(
+                    "INSERT OR REPLACE INTO idempotency (principal, message_id, content_hash, task_id) VALUES (?, ?, ?, ?)",
+                    (principal, message_id, content_hash, task_id)
+                )
+
+                return {
+                    "id": task_id,
+                    "contextId": row["context_id"],
+                    "state": "TASK_STATE_COMPLETED",
+                    "history": new_history,
+                    "artifacts": new_artifacts,
+                }
 
     # Canonical decision caching
     def get_cached_decision(self, package_content_hash: str) -> Optional[Dict[str, Any]]:
@@ -288,23 +293,24 @@ class Database:
             }
 
     def save_cached_decision(self, package_content_hash: str, decision: Dict[str, Any]):
-        with self._get_connection() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO decision_cache 
-                (package_content_hash, action, vendor_name, invoice_number, amount_minor, currency, evidence_refs_json, rationale)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    package_content_hash,
-                    decision["action"],
-                    decision["facts"]["vendorName"],
-                    decision["facts"]["invoiceNumber"],
-                    decision["facts"]["amountMinor"],
-                    decision["facts"]["currency"],
-                    json.dumps(decision["evidenceRefs"]),
-                    decision["rationale"],
+        with self._lock:
+            with self._get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO decision_cache 
+                    (package_content_hash, action, vendor_name, invoice_number, amount_minor, currency, evidence_refs_json, rationale)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        package_content_hash,
+                        decision["action"],
+                        decision["facts"]["vendorName"],
+                        decision["facts"]["invoiceNumber"],
+                        decision["facts"]["amountMinor"],
+                        decision["facts"]["currency"],
+                        json.dumps(decision["evidenceRefs"]),
+                        decision["rationale"],
+                    )
                 )
-            )
 
 db = Database()
