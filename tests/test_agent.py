@@ -378,3 +378,50 @@ def test_user_isolation():
     assert alice_list.status_code == 200
     assert len(alice_list.json()["tasks"]) == 1
     assert alice_list.json()["tasks"][0]["id"] == alice_task_id
+
+def test_canonical_decision_caching():
+    # Same canonical package text submitted under two completely different batchId, messageId, packageId namespaces
+    payload1 = {
+        "message": {
+            "messageId": "msg_run1",
+            "role": "ROLE_USER",
+            "parts": [{
+                "mediaType": MEDIA_BATCH_INPUT,
+                "data": {
+                    "batchId": "b_run1",
+                    "packages": [{"packageId": "pkg_orig_1", "text": "Vendor: Acme Corp. Duplicate payment record already paid. [REF-DUP-1] [REF-DUP-2] [REF-DUP-3]"}]
+                }
+            }]
+        }
+    }
+    resp1 = client.post("/a2a/message:send", json=payload1, headers=AUTH_HEADER_ALICE)
+    assert resp1.status_code == 200
+    prop1 = resp1.json()["task"]["artifacts"][0]["data"]["proposals"][0]
+    assert prop1["action"] == "reject_duplicate"
+
+    # Second run with different messageId, batchId, and packageId, but identical package text
+    payload2 = {
+        "message": {
+            "messageId": "msg_run2",
+            "role": "ROLE_USER",
+            "parts": [{
+                "mediaType": MEDIA_BATCH_INPUT,
+                "data": {
+                    "batchId": "b_run2",
+                    "packages": [{"packageId": "pkg_namespaced_2", "text": "Vendor: Acme Corp. Duplicate payment record already paid. [REF-DUP-1] [REF-DUP-2] [REF-DUP-3]"}]
+                }
+            }]
+        }
+    }
+    resp2 = client.post("/a2a/message:send", json=payload2, headers=AUTH_HEADER_ALICE)
+    assert resp2.status_code == 200
+    prop2 = resp2.json()["task"]["artifacts"][0]["data"]["proposals"][0]
+    
+    # Decisions match from cache
+    assert prop2["action"] == prop1["action"]
+    assert prop2["facts"] == prop1["facts"]
+    assert prop2["evidenceRefs"] == prop1["evidenceRefs"]
+    # But durable actionId and packageId reflect current run
+    assert prop2["packageId"] == "pkg_namespaced_2"
+    assert prop2["actionId"] != prop1["actionId"]
+
