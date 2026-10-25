@@ -5,6 +5,11 @@ class Settings:
     BASE_URL: Optional[str] = os.getenv("BASE_URL")
     AI_PROVIDER: str = os.getenv("AI_PROVIDER", "auto")
     
+    # Groq
+    GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+    
     # Gemini
     GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")

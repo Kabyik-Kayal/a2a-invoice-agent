@@ -19,20 +19,26 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You are an expert autonomous A2A Invoice Decision Agent.
 Your task is to review each invoice package and choose exactly one typed business action:
 - settle_invoice: valid, reconciled, and within autonomous delegated authority.
-- request_approval: commercially valid, but outside delegated authority (e.g. exceeds authority threshold).
-- hold_invoice: payment pauses until a stated verification completes (e.g. pending inspection, missing proof of delivery).
+- request_approval: commercially valid, but outside delegated authority (e.g. amount exceeds autonomous authority threshold).
+- hold_invoice: payment pauses until a stated verification completes (e.g. pending inspection, missing proof of delivery, hold instruction).
 - reject_duplicate: the same commercial invoice was already paid previously.
 - open_exception: material records conflict (e.g. unit price mismatch, tax ID conflict, purchase order conflict) needing exception workflow.
 
-RULES FOR EACH PACKAGE:
-1. Extract facts:
-   - vendorName: string
-   - invoiceNumber: string
-   - amountMinor: integer (total in minor units / cents / paise)
-   - currency: string (e.g., INR, USD, EUR)
-2. Return exactly the THREE decisive bracketed references (e.g. ["[REF-A]", "[REF-B]", "[REF-C]"]) from the specific paragraph that determines the action. Do not include cover-sheet references, archive examples, or training decoys.
-3. Rationale: must be between 60 and 1500 characters, explicitly state the chosen action name, and cite at least two of the decisive evidence references.
-4. Output strictly valid JSON with the schema:
+CRITICAL RULES FOR CONTROLLING FACTS & DECOYS:
+1. The documents mix useful facts with old historical examples, negation, and training decoys.
+2. Identify the CONTROLLING paragraph for the current transaction:
+   - Do NOT pick references from the cover-sheet (e.g. [REF-COVER-...]).
+   - Do NOT pick references from old archive examples (e.g. [REF-ARCHIVE-...]) or training decoys (e.g. [REF-DECOY-...]).
+   - Disregard irrelevant action words or negated claims (e.g. "There was NO duplicate", "Previously in 2021 we did X").
+3. For each package:
+   - vendorName: exact vendor/supplier name
+   - invoiceNumber: exact invoice identifier
+   - amountMinor: integer representing the invoice total in minor units (e.g. cents or paise, 1000.50 -> 100050)
+   - currency: 3-letter currency code (e.g., INR, USD, EUR)
+   - evidenceRefs: return EXACTLY the THREE decisive bracketed references (e.g. ["[REF-A]", "[REF-B]", "[REF-C]"]) from the specific paragraph that dictates the action.
+   - rationale: must be between 60 and 1500 characters, explicitly state the chosen action name, and explain how the evidence refs support the decision.
+
+Output strictly valid JSON with the schema:
 {
   "decisions": [
     {
@@ -131,6 +137,32 @@ def heuristic_decide_package(pkg_id: str, pkg_content: Any, policy_rev: str) -> 
         "rationale": rationale,
     }
 
+async def call_groq_api(packages_to_decide: List[Dict[str, Any]], policy_revision: str) -> List[Dict[str, Any]]:
+    """Batch call to Groq Cloud API with Llama 3.3 70B."""
+    prompt = f"Policy Revision: {policy_revision}\n\nEvaluate each of the following packages according to the rules and return JSON:\n" + json.dumps(packages_to_decide, indent=2)
+    url = f"{settings.GROQ_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": settings.GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+    }
+
+    async with httpx.AsyncClient(timeout=35.0) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        raw_text = data["choices"][0]["message"]["content"]
+        result = json.loads(raw_text)
+        return result.get("decisions", [])
+
 async def call_gemini_api(packages_to_decide: List[Dict[str, Any]], policy_revision: str) -> List[Dict[str, Any]]:
     """Batch call to Google Gemini Flash REST API."""
     prompt = f"{SYSTEM_PROMPT}\n\nPolicy Revision: {policy_revision}\n\nPackages to evaluate:\n"
@@ -203,19 +235,30 @@ async def decide_invoice_batch(packages: List[Dict[str, Any]], policy_revision: 
         ai_success = False
         decisions: List[Dict[str, Any]] = []
 
-        # Try Gemini if key is provided
+        # 1. Try Groq if GROQ_API_KEY is provided (fast & generous rate limits)
+        if settings.GROQ_API_KEY and not ai_success:
+            try:
+                decisions = await call_groq_api(uncached_packages, policy_revision)
+                if decisions:
+                    ai_success = True
+            except Exception as e:
+                logger.warning(f"Groq API call failed: {e}. Trying next provider...")
+
+        # 2. Try Gemini if GEMINI_API_KEY is provided
         if settings.GEMINI_API_KEY and not ai_success:
             try:
                 decisions = await call_gemini_api(uncached_packages, policy_revision)
-                ai_success = True
+                if decisions:
+                    ai_success = True
             except Exception as e:
-                logger.warning(f"Gemini API call failed: {e}. Falling back...")
+                logger.warning(f"Gemini API call failed: {e}. Trying next provider...")
 
-        # Try OpenAI if key is provided and Gemini didn't run
+        # 3. Try OpenAI if OPENAI_API_KEY is provided
         if settings.OPENAI_API_KEY and not ai_success:
             try:
                 decisions = await call_openai_api(uncached_packages, policy_revision)
-                ai_success = True
+                if decisions:
+                    ai_success = True
             except Exception as e:
                 logger.warning(f"OpenAI API call failed: {e}. Falling back...")
 
