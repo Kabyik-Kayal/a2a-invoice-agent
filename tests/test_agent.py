@@ -20,8 +20,16 @@ from app.models import (
 
 client = TestClient(app)
 
-AUTH_HEADER_ALICE = {"Authorization": "Bearer token_alice_123", "A2A-Version": "1.0"}
-AUTH_HEADER_BOB = {"Authorization": "Bearer token_bob_456", "A2A-Version": "1.0"}
+AUTH_HEADER_ALICE = {
+    "Authorization": "Bearer token_alice_123",
+    "A2A-Version": "1.0",
+    "Content-Type": "application/a2a+json",
+}
+AUTH_HEADER_BOB = {
+    "Authorization": "Bearer token_bob_456",
+    "A2A-Version": "1.0",
+    "Content-Type": "application/a2a+json",
+}
 
 @pytest.fixture(autouse=True)
 def clean_db():
@@ -47,17 +55,29 @@ def test_agent_card():
     assert len(card["supportedInterfaces"]) >= 1
 
 def test_auth_and_version_checks():
-    # Missing auth
-    resp = client.post("/a2a/message:send", json={}, headers={"A2A-Version": "1.0"})
+    # Missing auth on POST /message:send
+    resp = client.post("/a2a/message:send", json={}, headers={"A2A-Version": "1.0", "Content-Type": "application/a2a+json"})
     assert resp.status_code == 401
 
+    # Missing auth on GET /tasks (LIST_AUTH_REQUIRED)
+    resp_list_no_auth = client.get("/a2a/tasks")
+    assert resp_list_no_auth.status_code == 401
+
     # Missing A2A-Version
-    resp = client.post("/a2a/message:send", json={}, headers={"Authorization": "Bearer token123"})
+    resp = client.post("/a2a/message:send", json={}, headers={"Authorization": "Bearer token123", "Content-Type": "application/a2a+json"})
     assert resp.status_code == 400
 
     # Wrong A2A-Version
-    resp = client.post("/a2a/message:send", json={}, headers={"Authorization": "Bearer token123", "A2A-Version": "2.0"})
+    resp = client.post("/a2a/message:send", json={}, headers={"Authorization": "Bearer token123", "A2A-Version": "2.0", "Content-Type": "application/a2a+json"})
     assert resp.status_code == 400
+
+    # Unsupported Media Type (A2A_MEDIA_TYPE_REJECTION)
+    resp_wrong_ct = client.post("/a2a/message:send", json={}, headers={"Authorization": "Bearer token123", "A2A-Version": "1.0", "Content-Type": "application/json"})
+    assert resp_wrong_ct.status_code == 415
+
+    resp_xml = client.post("/a2a/message:send", data="<xml></xml>", headers={"Authorization": "Bearer token123", "A2A-Version": "1.0", "Content-Type": "application/xml"})
+    assert resp_xml.status_code == 415
+
 
 def test_initial_batch_submission_and_proposals():
     payload = {

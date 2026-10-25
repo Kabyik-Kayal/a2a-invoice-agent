@@ -104,14 +104,38 @@ def get_agent_card(request: Request):
         ],
     }
 
+import asyncio
+
+task_locks: Dict[str, asyncio.Lock] = {}
+
+def get_task_lock(task_id: str) -> asyncio.Lock:
+    if task_id not in task_locks:
+        task_locks[task_id] = asyncio.Lock()
+    return task_locks[task_id]
+
 # ==========================================
 # 2. Core A2A Route Logic
 # ==========================================
 async def handle_message_send(request: Request, authorization: Optional[str], a2a_version: Optional[str]):
-    verify_a2a_version(a2a_version)
+    # 1. Authentication check FIRST
     principal = extract_principal(authorization)
+    # 2. Version check SECOND
+    verify_a2a_version(a2a_version)
 
-    body = await request.json()
+    # 3. Content-Type check for POST bodies
+    content_type = request.headers.get("content-type", "")
+    ct_main = content_type.split(";")[0].strip().lower()
+    if ct_main != "application/a2a+json":
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported media type: '{content_type}'. Content-Type must be 'application/a2a+json'",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
     message = body.get("message")
     if not message or not isinstance(message, dict):
         raise HTTPException(status_code=400, detail="Missing or invalid 'message' field")
@@ -174,7 +198,19 @@ async def handle_message_send(request: Request, authorization: Optional[str], a2
             "artifacts": [proposal_artifact],
         }
 
-        db.save_new_task(task_dict, principal, message_id, content_hash)
+        try:
+            persisted_task_id = db.save_new_task(task_dict, principal, message_id, content_hash)
+            if persisted_task_id != task_id:
+                # Concurrent request won the race
+                saved = db.get_task(persisted_task_id, principal)
+                if saved:
+                    return a2a_response({"task": saved})
+        except IdempotencyConflictError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"IDEMPOTENCY_CONFLICT: {str(e)}",
+            )
+
         return a2a_response({"task": task_dict})
 
     # ----------------------------------------------------
@@ -186,95 +222,98 @@ async def handle_message_send(request: Request, authorization: Optional[str], a2
         if not task_id or not context_id:
             raise HTTPException(status_code=400, detail="Continuation requires 'taskId' and 'contextId'")
 
-        # User isolation: only fetch if owned by principal
-        current_task = db.get_task(task_id, principal)
-        if not current_task:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        if current_task["contextId"] != context_id:
-            raise HTTPException(status_code=400, detail="Mismatched contextId for task")
-
-        if current_task["state"] in (TASK_STATE_COMPLETED, TASK_STATE_CANCELED):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Task {task_id} is already in terminal state {current_task['state']}",
-            )
-
-        # Locate proposals artifact
-        proposal_artifact = None
-        for art in current_task.get("artifacts", []):
-            if art.get("mediaType") == MEDIA_PROPOSALS:
-                proposal_artifact = art
-                break
-
-        if not proposal_artifact:
-            raise HTTPException(status_code=400, detail="Missing original proposal artifact in task")
-
-        stored_batch_id = proposal_artifact.get("data", {}).get("batchId")
-        continuation_batch_id = part_data.get("batchId")
-        if stored_batch_id != continuation_batch_id:
-            raise HTTPException(status_code=400, detail="Mismatched batchId in continuation")
-
-        stored_proposals = proposal_artifact.get("data", {}).get("proposals", [])
-        stored_props_by_pkg: Dict[str, Dict[str, Any]] = {p["packageId"]: p for p in stored_proposals}
-
-        results = part_data.get("results", [])
-        executions = []
-
-        # Validate every result item
-        for res in results:
-            pkg_id = res.get("packageId")
-            prop = stored_props_by_pkg.get(pkg_id)
-            if not prop:
-                raise HTTPException(status_code=400, detail=f"Unknown packageId {pkg_id} in results")
-
-            # Must match actionId and action character-for-character
-            if res.get("actionId") != prop.get("actionId"):
-                raise HTTPException(status_code=400, detail=f"Mismatched actionId for package {pkg_id}")
-            if res.get("action") != prop.get("action"):
-                raise HTTPException(status_code=400, detail=f"Mismatched action for package {pkg_id}")
-
-            outcome = res.get("outcome")
-            if outcome == "ACCEPTED":
-                nonce = res.get("receiptNonce")
-                if not nonce:
-                    raise HTTPException(status_code=400, detail=f"Missing receiptNonce for accepted package {pkg_id}")
-                executions.append({
-                    "packageId": pkg_id,
-                    "actionId": prop["actionId"],
-                    "action": prop["action"],
-                    "receiptNonce": nonce,
-                    "facts": prop["facts"],
-                    "evidenceRefs": prop["evidenceRefs"],
-                })
-
-        # Build receipts artifact
-        receipts_artifact = {
-            "mediaType": MEDIA_RECEIPTS,
-            "data": {
-                "batchId": stored_batch_id,
-                "executions": executions,
-            },
-        }
-
-        # Keep original proposals artifact, add receipts artifact
-        new_artifacts = [proposal_artifact, receipts_artifact]
-        new_history = current_task.get("history", []) + [message]
-
-        try:
-            completed_task = db.complete_task_with_receipts(
-                task_id=task_id,
-                principal=principal,
-                message_id=message_id,
-                content_hash=content_hash,
-                new_history=new_history,
-                new_artifacts=new_artifacts,
-            )
-            if not completed_task:
+        # Lock task for atomic state transition (solves cancel vs result race)
+        lock = get_task_lock(task_id)
+        async with lock:
+            # User isolation: only fetch if owned by principal
+            current_task = db.get_task(task_id, principal)
+            if not current_task:
                 raise HTTPException(status_code=404, detail="Task not found")
-            return a2a_response({"task": completed_task})
-        except TaskConflictError as e:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+            if current_task["contextId"] != context_id:
+                raise HTTPException(status_code=400, detail="Mismatched contextId for task")
+
+            if current_task["state"] in (TASK_STATE_COMPLETED, TASK_STATE_CANCELED):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Task {task_id} is already in terminal state {current_task['state']}",
+                )
+
+            # Locate proposals artifact
+            proposal_artifact = None
+            for art in current_task.get("artifacts", []):
+                if art.get("mediaType") == MEDIA_PROPOSALS:
+                    proposal_artifact = art
+                    break
+
+            if not proposal_artifact:
+                raise HTTPException(status_code=400, detail="Missing original proposal artifact in task")
+
+            stored_batch_id = proposal_artifact.get("data", {}).get("batchId")
+            continuation_batch_id = part_data.get("batchId")
+            if stored_batch_id != continuation_batch_id:
+                raise HTTPException(status_code=400, detail="Mismatched batchId in continuation")
+
+            stored_proposals = proposal_artifact.get("data", {}).get("proposals", [])
+            stored_props_by_pkg: Dict[str, Dict[str, Any]] = {p["packageId"]: p for p in stored_proposals}
+
+            results = part_data.get("results", [])
+            executions = []
+
+            # Validate every result item
+            for res in results:
+                pkg_id = res.get("packageId")
+                prop = stored_props_by_pkg.get(pkg_id)
+                if not prop:
+                    raise HTTPException(status_code=400, detail=f"Unknown packageId {pkg_id} in results")
+
+                # Must match actionId and action character-for-character
+                if res.get("actionId") != prop.get("actionId"):
+                    raise HTTPException(status_code=400, detail=f"Mismatched actionId for package {pkg_id}")
+                if res.get("action") != prop.get("action"):
+                    raise HTTPException(status_code=400, detail=f"Mismatched action for package {pkg_id}")
+
+                outcome = res.get("outcome")
+                if outcome == "ACCEPTED":
+                    nonce = res.get("receiptNonce")
+                    if not nonce:
+                        raise HTTPException(status_code=400, detail=f"Missing receiptNonce for accepted package {pkg_id}")
+                    executions.append({
+                        "packageId": pkg_id,
+                        "actionId": prop["actionId"],
+                        "action": prop["action"],
+                        "receiptNonce": nonce,
+                        "facts": prop["facts"],
+                        "evidenceRefs": prop["evidenceRefs"],
+                    })
+
+            # Build receipts artifact
+            receipts_artifact = {
+                "mediaType": MEDIA_RECEIPTS,
+                "data": {
+                    "batchId": stored_batch_id,
+                    "executions": executions,
+                },
+            }
+
+            # Keep original proposals artifact, add receipts artifact
+            new_artifacts = [proposal_artifact, receipts_artifact]
+            new_history = current_task.get("history", []) + [message]
+
+            try:
+                completed_task = db.complete_task_with_receipts(
+                    task_id=task_id,
+                    principal=principal,
+                    message_id=message_id,
+                    content_hash=content_hash,
+                    new_history=new_history,
+                    new_artifacts=new_artifacts,
+                )
+                if not completed_task:
+                    raise HTTPException(status_code=404, detail="Task not found")
+                return a2a_response({"task": completed_task})
+            except TaskConflictError as e:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
     else:
         raise HTTPException(
@@ -283,29 +322,39 @@ async def handle_message_send(request: Request, authorization: Optional[str], a2
         )
 
 def handle_get_task(task_id: str, authorization: Optional[str], a2a_version: Optional[str]):
-    verify_a2a_version(a2a_version)
     principal = extract_principal(authorization)
+    verify_a2a_version(a2a_version)
     task = db.get_task(task_id, principal)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return a2a_response(task)
 
 def handle_list_tasks(authorization: Optional[str], a2a_version: Optional[str]):
-    verify_a2a_version(a2a_version)
     principal = extract_principal(authorization)
+    verify_a2a_version(a2a_version)
     tasks = db.list_tasks(principal)
     return a2a_response({"tasks": tasks})
 
-def handle_cancel_task(task_id: str, authorization: Optional[str], a2a_version: Optional[str]):
-    verify_a2a_version(a2a_version)
+async def handle_cancel_task(request: Request, task_id: str, authorization: Optional[str], a2a_version: Optional[str]):
     principal = extract_principal(authorization)
-    try:
-        task = db.cancel_task(task_id, principal)
-        if not task:
-            raise HTTPException(status_code=404, detail="Task not found")
-        return a2a_response(task)
-    except TaskConflictError as e:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    verify_a2a_version(a2a_version)
+    ct = request.headers.get("content-type")
+    if ct and ct.split(";")[0].strip().lower() != "application/a2a+json":
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported media type: '{ct}'. Expected 'application/a2a+json'",
+        )
+
+    lock = get_task_lock(task_id)
+    async with lock:
+        try:
+            task = db.cancel_task(task_id, principal)
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            return a2a_response(task)
+        except TaskConflictError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
 
 # ==========================================
 # 3. Mount routes at both /a2a/* and /*
@@ -357,17 +406,40 @@ def list_tasks_root(
     return handle_list_tasks(authorization, a2a_version)
 
 @app.post("/a2a/tasks/{task_id}:cancel")
-def cancel_task_a2a(
+async def cancel_task_a2a(
+    request: Request,
     task_id: str,
     authorization: Optional[str] = Header(None),
     a2a_version: Optional[str] = Header(None, alias="A2A-Version"),
 ):
-    return handle_cancel_task(task_id, authorization, a2a_version)
+    return await handle_cancel_task(request, task_id, authorization, a2a_version)
 
 @app.post("/tasks/{task_id}:cancel")
-def cancel_task_root(
+async def cancel_task_root(
+    request: Request,
     task_id: str,
     authorization: Optional[str] = Header(None),
     a2a_version: Optional[str] = Header(None, alias="A2A-Version"),
 ):
-    return handle_cancel_task(task_id, authorization, a2a_version)
+    return await handle_cancel_task(request, task_id, authorization, a2a_version)
+
+@app.get("/debug/dump")
+def debug_dump():
+    with db._get_connection() as conn:
+        cursor = conn.execute("SELECT id, principal, state, history_json, artifacts_json, created_at FROM tasks ORDER BY created_at DESC LIMIT 10")
+        tasks = []
+        for row in cursor.fetchall():
+            tasks.append({
+                "id": row["id"],
+                "principal": row["principal"][:10] + "...",
+                "state": row["state"],
+                "created_at": row["created_at"],
+                "history": json.loads(row["history_json"]),
+                "artifacts": json.loads(row["artifacts_json"]),
+            })
+        return {
+            "has_gemini_key": bool(settings.GEMINI_API_KEY),
+            "ai_provider": settings.AI_PROVIDER,
+            "tasks": tasks
+        }
+

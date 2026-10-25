@@ -91,27 +91,41 @@ class Database:
                 (principal, message_id, content_hash, task_id)
             )
 
-    def save_new_task(self, task_dict: Dict[str, Any], principal: str, message_id: str, content_hash: str):
+    def save_new_task(self, task_dict: Dict[str, Any], principal: str, message_id: str, content_hash: str) -> str:
         """Atomically persist a newly created task and its idempotency record."""
         with self._get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO tasks (id, principal, context_id, state, history_json, artifacts_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_dict["id"],
-                    principal,
-                    task_dict["contextId"],
-                    task_dict["state"],
-                    json.dumps(task_dict.get("history", [])),
-                    json.dumps(task_dict.get("artifacts", [])),
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO tasks (id, principal, context_id, state, history_json, artifacts_json)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_dict["id"],
+                        principal,
+                        task_dict["contextId"],
+                        task_dict["state"],
+                        json.dumps(task_dict.get("history", [])),
+                        json.dumps(task_dict.get("artifacts", [])),
+                    )
                 )
-            )
-            conn.execute(
-                "INSERT INTO idempotency (principal, message_id, content_hash, task_id) VALUES (?, ?, ?, ?)",
-                (principal, message_id, content_hash, task_dict["id"])
-            )
+                conn.execute(
+                    "INSERT INTO idempotency (principal, message_id, content_hash, task_id) VALUES (?, ?, ?, ?)",
+                    (principal, message_id, content_hash, task_dict["id"])
+                )
+                return task_dict["id"]
+            except sqlite3.IntegrityError:
+                # Race condition: concurrent equivalent request already saved this message
+                cursor = conn.execute(
+                    "SELECT task_id, content_hash FROM idempotency WHERE principal = ? AND message_id = ?",
+                    (principal, message_id)
+                )
+                row = cursor.fetchone()
+                if row:
+                    if row["content_hash"] == content_hash:
+                        return row["task_id"]
+                    raise IdempotencyConflictError(f"IDEMPOTENCY_CONFLICT: Message {message_id} reused with changed content.")
+                raise
 
     def get_task(self, task_id: str, principal: str) -> Optional[Dict[str, Any]]:
         """Fetch task only if it belongs to principal."""
