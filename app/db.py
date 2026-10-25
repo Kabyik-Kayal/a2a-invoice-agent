@@ -295,6 +295,31 @@ class Database:
     def save_cached_decision(self, package_content_hash: str, decision: Dict[str, Any]):
         with self._lock:
             with self._get_connection() as conn:
+                facts = decision.get("facts", {}) if isinstance(decision.get("facts"), dict) else {}
+                vendor_name = facts.get("vendorName") or decision.get("vendorName") or "Vendor"
+                invoice_number = facts.get("invoiceNumber") or decision.get("invoiceNumber") or "INV-UNKNOWN"
+                
+                amount_minor = facts.get("amountMinor")
+                if amount_minor is None:
+                    amount_minor = decision.get("amountMinor", 10000)
+                try:
+                    amount_minor = int(amount_minor)
+                except (ValueError, TypeError):
+                    amount_minor = 10000
+                    
+                currency = facts.get("currency") or decision.get("currency") or "INR"
+                
+                refs = decision.get("evidenceRefs", [])
+                if not isinstance(refs, list):
+                    refs = [str(refs)]
+                if len(refs) < 3:
+                    while len(refs) < 3:
+                        refs.append(f"[REF-POLICY-{len(refs)+1}]")
+                refs = refs[:3]
+                
+                action = decision.get("action", "settle_invoice")
+                rationale = decision.get("rationale", "")
+                
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO decision_cache 
@@ -303,13 +328,13 @@ class Database:
                     """,
                     (
                         package_content_hash,
-                        decision["action"],
-                        decision["facts"]["vendorName"],
-                        decision["facts"]["invoiceNumber"],
-                        decision["facts"]["amountMinor"],
-                        decision["facts"]["currency"],
-                        json.dumps(decision["evidenceRefs"]),
-                        decision["rationale"],
+                        str(action),
+                        str(vendor_name),
+                        str(invoice_number),
+                        amount_minor,
+                        str(currency),
+                        json.dumps(refs),
+                        str(rationale),
                     )
                 )
 

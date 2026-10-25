@@ -10,7 +10,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.12.3
       - key: AI_PROVIDER
-        value: groq
+        value: auto
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_MODEL

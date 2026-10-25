@@ -445,3 +445,26 @@ def test_canonical_decision_caching():
     assert prop2["packageId"] == "pkg_namespaced_2"
     assert prop2["actionId"] != prop1["actionId"]
 
+def test_flat_decision_normalization_and_caching():
+    # Directly test db.save_cached_decision with flat format (like Groq/LLM responses)
+    flat_decision = {
+        "action": "open_exception",
+        "vendorName": "Flat Vendor LLC",
+        "invoiceNumber": "INV-FLAT-99",
+        "amountMinor": 88000,
+        "currency": "USD",
+        "evidenceRefs": ["[REF-E1]", "[REF-E2]", "[REF-E3]"],
+        "rationale": "Flat decision test open_exception [REF-E1] [REF-E2] verified against financial controls."
+    }
+    test_hash = "test_flat_hash_12345"
+    db.save_cached_decision(test_hash, flat_decision)
+    cached = db.get_cached_decision(test_hash)
+    assert cached is not None
+    assert cached["action"] == "open_exception"
+    assert cached["facts"]["vendorName"] == "Flat Vendor LLC"
+    assert cached["facts"]["invoiceNumber"] == "INV-FLAT-99"
+    assert cached["facts"]["amountMinor"] == 88000
+    assert cached["facts"]["currency"] == "USD"
+    assert len(cached["evidenceRefs"]) == 3
+
+
